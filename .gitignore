@@ -1,0 +1,7 @@
+# generated / local noise — never published
+test/.fixtures/
+*.tmp
+# editor / OS noise
+*.swp
+*~
+.DS_Store

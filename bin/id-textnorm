@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# id-textnorm — normalize Indonesian dates & numbers in a text stream.
+#
+# Reads text line by line from stdin (or files), writes the same text to
+# stdout with:
+#   * Indonesian dates  -> ISO 8601  ("18 Oktober 2026", "18/10/2026" -> "2026-10-18")
+#   * Indonesian numbers -> machine format ("1.234.567,89" -> "1234567.89",
+#     "2,5 juta" -> "2500000")
+#
+# Pure bash, zero dependencies, true streaming (one line in memory at a time).
+# Works on Linux, macOS, Windows (Git Bash) and Termux — no GNU date needed.
+set -uo pipefail
+shopt -s nocasematch   # Indonesian month/magnitude words match in any case
+
+VERSION="1.0.0"
+PROG="id-textnorm"
+
+MODE="both"      # both | dates | numbers
+JSON_OUT=0
+
+# Per-line results, set by normalize_line.
+L=""             # transformed line
+NDATES=0
+NNUMBERS=0
+JE=""            # json_escape result
+MM=""            # month_num result
+DIM=""           # days_in_month result
+MV=""            # magnitude_value result (empty + rc=1 on overflow)
+
+err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+usage() {
+  cat <<'EOF'
+Usage: id-textnorm [OPTIONS] [FILE...]
+
+Normalize Indonesian-format dates and numbers in a text stream.
+
+Reads UTF-8 text line by line from stdin (or the given files) and writes it
+to stdout with dates converted to ISO 8601 (YYYY-MM-DD) and numbers converted
+to machine format. Never loads the whole input into memory.
+
+Date rules (Indonesian convention, DD before MM):
+  "18 Oktober 2026", "18 Okt 2026", "Senin, 18 Oktober 2026" -> 2026-10-18
+  "18/10/2026", "18-10-2026" -> 2026-10-18
+  Invalid dates ("30 Februari 2026", "32/01/2026") are left untouched.
+  Already-ISO dates ("2026-10-18") are left untouched.
+
+Number rules:
+  "1.234.567"      -> 1234567        (dot = thousands separator)
+  "1.234.567,89"   -> 1234567.89     (comma = decimal separator)
+  "3,5"            -> 3.5
+  "2,5 juta"       -> 2500000        (ribu/juta/miliar/triliun)
+  "100 ribu"       -> 100000
+  "Rp 1.234.567"   -> Rp 1234567     ("Rp" itself is kept)
+  "192.168.1.1", "v1.2.3", "3.14" are left untouched.
+
+Options:
+  --dates-only    only normalize dates
+  --numbers-only  only normalize numbers
+  --json          emit one JSON object per input line instead of plain text:
+                  {"line":N,"input":"...","output":"...","dates":D,"numbers":M}
+  -h, --help      show this help and exit
+  -V, --version   show version and exit
+
+Exit codes: 0 success, 1 runtime error (e.g. file not found), 2 bad usage.
+
+Examples:
+  id-textnorm < laporan.txt
+  cat data.csv | id-textnorm --numbers-only
+  id-textnorm --json access.log | jq -r .output
+EOF
+}
+
+# ---------- calendar helpers (pure bash, no GNU date) ----------
+
+is_leap() { # $1 = year; returns 0 when leap
+  local y=$1
+  if (( (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 )); then
+    return 0
+  fi
+  return 1
+}
+
+days_in_month() { # $1 = month (1-12), $2 = year; sets DIM
+  local m=$1 y=$2
+  case $m in
+    1|3|5|7|8|10|12) DIM=31 ;;
+    4|6|9|11)        DIM=30 ;;
+    2)  if is_leap "$y"; then DIM=29; else DIM=28; fi ;;
+    *)  DIM=0 ;;
+  esac
+}
+
+month_num() { # $1 = Indonesian month name (any case); sets MM (01-12) or empty
+  # relies on global nocasematch
+  case "$1" in
+    januari|jan)   MM=01 ;;
+    februari|feb)  MM=02 ;;
+    maret|mar)     MM=03 ;;
+    april|apr)     MM=04 ;;
+    mei)           MM=05 ;;
+    juni|jun)      MM=06 ;;
+    juli|jul)      MM=07 ;;
+    agustus|agu)   MM=08 ;;
+    september|sep|sept) MM=09 ;;
+    oktober|okt)   MM=10 ;;
+    november|nov)  MM=11 ;;
+    desember|des)  MM=12 ;;
+    *)             MM="" ;;
+  esac
+}
+
+# ---------- magnitude math (pure bash integer arithmetic) ----------
+
+magnitude_value() { # $1 = decimal string ("2.5"), $2 = power of ten;
+                      # sets MV; returns 1 on overflow risk (caller keeps text as-is)
+  local v=$1 k=$2 int frac scale digits
+  int=${v%%.*}
+  frac=""
+  if [[ $v == *.* ]]; then frac=${v#*.}; fi
+  scale=${#frac}
+  digits="${int}${frac}"
+  while [[ $digits == 0* && ${#digits} -gt 1 ]]; do digits=${digits#0}; done
+  if (( ${#digits} + k > 18 )); then return 1; fi  # avoid 64-bit overflow
+  if (( k >= scale )); then
+    printf -v MV '%d' "$(( digits * 10 ** (k - scale) ))"
+  else
+    local num=$(( digits * 10 ** k )) den=$(( 10 ** scale ))
+    local q=$(( num / den )) r=$(( num % den )) rs
+    printf -v rs '%0*d' "$scale" "$r"
+    while [[ $rs == *0 ]]; do rs=${rs%0}; done
+    printf -v MV '%d.%s' "$q" "$rs"
+  fi
+}
+
+json_escape() { # $1 = raw; sets JE to JSON-escaped string
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  # Any other C0 control char would make invalid JSON: escape as \u00XX.
+  # (ESC 0x1B is common in colored logs piped through --json.)
+  local i ch esc
+  for i in 1 2 3 4 5 6 7 8 11 12 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+    printf -v ch '%b' "$(printf '\\0%03o' "$i")"  # the actual control byte
+    printf -v esc '\\u%04x' "$i"                  # its \u00XX text form
+    s=${s//"$ch"/$esc}
+  done
+  JE=$s
+}
+
+# ---------- pattern appliers ----------
+# Each reads/writes the global L and bumps NDATES / NNUMBERS.
+# A match that fails validation is kept verbatim (we still advance past it).
+#
+# LEAD/LEAD2: a match may also begin right after an ANSI SGR color sequence
+# (e.g. "\x1b[31m18/10/2026" in colored logs); the sequence is re-emitted
+# verbatim as part of the replacement.
+LEAD="(^|[^[:alnum:]]|"$'\x1b'"\[[0-9;]*m)"
+LEAD2="(^|[^[:alnum:],]|"$'\x1b'"\[[0-9;]*m)"
+
+apply_date_month() {
+  local re="${LEAD}([0-9]{1,2})[[:space:]]+(januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember|jan|feb|mar|apr|jun|jul|agu|sep|sept|okt|nov|des),?[[:space:]]+([0-9]{4})([^[:alnum:]]|$)"
+  local out="" rest=$L full lead day mon year trail d rep pre post
+  while [[ $rest =~ $re ]]; do
+    full="${BASH_REMATCH[0]}"
+    lead="${BASH_REMATCH[1]}"; day="${BASH_REMATCH[2]}"; mon="${BASH_REMATCH[3]}"
+    year="${BASH_REMATCH[4]}"; trail="${BASH_REMATCH[5]}"
+    month_num "$mon"
+    d=$((10#$day))
+    days_in_month "$((10#$MM))" "$year"
+    if (( d >= 1 && d <= DIM )); then
+      printf -v rep '%s%04d-%02d-%02d%s' "$lead" "$year" "$((10#$MM))" "$d" "$trail"
+      NDATES=$((NDATES + 1))
+    else
+      rep=$full
+    fi
+    pre="${rest%%"$full"*}"
+    post="${rest#*"$full"}"
+    out+="${pre}${rep}"
+    rest=$post
+  done
+  L="${out}${rest}"
+}
+
+apply_date_numeric() {
+  local re="${LEAD}([0-9]{1,2})([/-])([0-9]{1,2})([/-])([0-9]{4})([^[:alnum:]]|$)"
+  local out="" rest=$L full lead day month year trail m d rep pre post
+  while [[ $rest =~ $re ]]; do
+    full="${BASH_REMATCH[0]}"
+    lead="${BASH_REMATCH[1]}"; day="${BASH_REMATCH[2]}"
+    month="${BASH_REMATCH[4]}"; year="${BASH_REMATCH[6]}"; trail="${BASH_REMATCH[7]}"
+    m=$((10#$month)); d=$((10#$day))
+    days_in_month "$m" "$year"
+    if (( m >= 1 && m <= 12 && d >= 1 && d <= DIM )); then
+      printf -v rep '%s%04d-%02d-%02d%s' "$lead" "$year" "$m" "$d" "$trail"
+      NDATES=$((NDATES + 1))
+    else
+      rep=$full
+    fi
+    pre="${rest%%"$full"*}"
+    post="${rest#*"$full"}"
+    out+="${pre}${rep}"
+    rest=$post
+  done
+  L="${out}${rest}"
+}
+
+apply_magnitude() {
+  local re="${LEAD}([0-9]+([.,][0-9]+)?)[[:space:]]+(ribu|juta|miliar|triliun)([^[:alnum:]]|$)"
+  local out="" rest=$L full lead num word trail k v rep pre post
+  while [[ $rest =~ $re ]]; do
+    full="${BASH_REMATCH[0]}"
+    lead="${BASH_REMATCH[1]}"; num="${BASH_REMATCH[2]}"
+    word="${BASH_REMATCH[4]}"; trail="${BASH_REMATCH[5]}"
+    case "$word" in
+      ribu) k=3 ;; juta) k=6 ;; miliar) k=9 ;; triliun) k=12 ;;
+    esac
+    v=${num//./}
+    v=${v/,/.}
+    if magnitude_value "$v" "$k"; then
+      rep="${lead}${MV}${trail}"
+      NNUMBERS=$((NNUMBERS + 1))
+    else
+      rep=$full
+    fi
+    pre="${rest%%"$full"*}"
+    post="${rest#*"$full"}"
+    out+="${pre}${rep}"
+    rest=$post
+  done
+  L="${out}${rest}"
+}
+
+apply_thousands() {
+  # NOTE: trailing boundary excludes "." so IPv4 addresses (192.168.1.1)
+  # can never match: "192.168" would need "." as the boundary char.
+  local re="${LEAD}([0-9]{1,3}(\.[0-9]{3})+)(,[0-9]+)?([^[:alnum:].]|$)"
+  local out="" rest=$L full lead intpart fracpart trail rep pre post
+  while [[ $rest =~ $re ]]; do
+    full="${BASH_REMATCH[0]}"
+    lead="${BASH_REMATCH[1]}"; intpart="${BASH_REMATCH[2]}"
+    fracpart="${BASH_REMATCH[4]}"; trail="${BASH_REMATCH[5]}"
+    rep="${lead}${intpart//./}"
+    if [[ -n $fracpart ]]; then rep+="${fracpart/,/.}"; fi
+    rep+="$trail"
+    NNUMBERS=$((NNUMBERS + 1))
+    pre="${rest%%"$full"*}"
+    post="${rest#*"$full"}"
+    out+="${pre}${rep}"
+    rest=$post
+  done
+  L="${out}${rest}"
+}
+
+apply_decimal_comma() {
+  local re="${LEAD2}([0-9]+),([0-9]{1,2})([^[:alnum:]]|$)"
+  local out="" rest=$L full lead intpart fracpart trail rep pre post
+  while [[ $rest =~ $re ]]; do
+    full="${BASH_REMATCH[0]}"
+    lead="${BASH_REMATCH[1]}"; intpart="${BASH_REMATCH[2]}"
+    fracpart="${BASH_REMATCH[3]}"; trail="${BASH_REMATCH[4]}"
+    rep="${lead}${intpart}.${fracpart}${trail}"
+    NNUMBERS=$((NNUMBERS + 1))
+    pre="${rest%%"$full"*}"
+    post="${rest#*"$full"}"
+    out+="${pre}${rep}"
+    rest=$post
+  done
+  L="${out}${rest}"
+}
+
+# ---------- line pipeline ----------
+
+normalize_line() { # $1 = input line; sets L, NDATES, NNUMBERS
+  L=$1
+  NDATES=0
+  NNUMBERS=0
+  # Cheap glob pre-checks: skip the regex engine when a line cannot match.
+  # (case patterns are case-insensitive thanks to global nocasematch.)
+  if [[ $MODE != "numbers" ]]; then
+    case $L in
+      *januari*|*februari*|*maret*|*april*|*mei*|*juni*|*juli*|*agustus*|\
+      *september*|*oktober*|*november*|*desember*|*jan*|*feb*|*mar*|*apr*|\
+      *jun*|*jul*|*agu*|*sep*|*okt*|*nov*|*des*) apply_date_month ;;
+    esac
+    case $L in
+      *[0-9]\/[0-9]*|*[0-9]-[0-9]*) apply_date_numeric ;;
+    esac
+  fi
+  if [[ $MODE != "dates" ]]; then
+    case $L in
+      *ribu*|*juta*|*miliar*|*triliun*) apply_magnitude ;;
+    esac
+    case $L in
+      *[0-9].[0-9][0-9][0-9]*) apply_thousands ;;
+    esac
+    case $L in
+      *[0-9],[0-9]*) apply_decimal_comma ;;
+    esac
+  fi
+}
+
+emit_line() { # $1 = original line, $2 = line number
+  if (( JSON_OUT )); then
+    json_escape "$1"; local je_in=$JE
+    json_escape "$L"; local je_out=$JE
+    printf '{"line":%d,"input":"%s","output":"%s","dates":%d,"numbers":%d}\n' \
+      "$2" "$je_in" "$je_out" "$NDATES" "$NNUMBERS"
+  else
+    printf '%s\n' "$L"
+  fi
+}
+
+process_stream() {
+  local line line_no=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    line_no=$((line_no + 1))
+    normalize_line "$line"
+    emit_line "$line" "$line_no"
+  done
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -h|--help)    usage; exit 0 ;;
+      -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+      --dates-only)   MODE="dates"; shift ;;
+      --numbers-only) MODE="numbers"; shift ;;
+      --json)         JSON_OUT=1; shift ;;
+      --) shift; break ;;
+      -*) err "unknown option: $1 (try --help)"; exit 2 ;;
+      *) break ;;
+    esac
+  done
+
+  if [[ $# -eq 0 ]]; then
+    process_stream
+  else
+    local f
+    for f in "$@"; do
+      if [[ $f == "-" ]]; then
+        process_stream
+      elif [[ -f $f ]]; then
+        if [[ -r $f ]]; then
+          process_stream < "$f"
+        else
+          err "cannot read file: $f"
+          exit 1
+        fi
+      else
+        err "no such file: $f"
+        exit 1
+      fi
+    done
+  fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
